@@ -3,6 +3,7 @@
 import fs from "node:fs";
 import crypto from "node:crypto";
 import { Buffer } from 'node:buffer';
+import PouchDB from 'pouchdb';
 
 // Databases
 import Nano from "nano";
@@ -11,14 +12,15 @@ import { createClient } from "redis";
 
 // Networking & Server
 import express from "express";
+import cors from "cors";
+import expressPouchDB from "express-pouchdb"
 import proxy from "express-http-proxy";
 import session from "express-session";
 import redisConnect from 'connect-redis';
 import { WebSocketServer } from "ws";
 import axios from "axios";
 import sgMail from "@sendgrid/mail";
-import config from "../config.js";
-import Stripe from 'stripe';
+import config from "../../config.js";
 
 // Misc
 import _ from "lodash";
@@ -62,6 +64,11 @@ const resetTokenDelete = db.prepare('DELETE FROM resetTokens WHERE email = ?');
 
 // Trees Table
 db.exec('CREATE TABLE IF NOT EXISTS trees (id TEXT PRIMARY KEY, name TEXT, location TEXT, owner TEXT, collaborators TEXT, inviteUrl TEXT, createdAt INTEGER, updatedAt INTEGER, deletedAt INTEGER)');
+db.exec('CREATE TABLE IF NOT EXISTS cards (id TEXT PRIMARY KEY, treeId TEXT, content TEXT, parentId TEXT, position FLOAT, updatedAt TEXT, deleted BOOLEAN)');
+db.exec('CREATE INDEX IF NOT EXISTS cards_treeId ON cards (treeId)');
+db.exec('CREATE TABLE IF NOT EXISTS tree_snapshots ( snapshot TEXT, treeId TEXT, id TEXT, content TEXT, parentId TEXT, position REAL, updatedAt TEXT, delta BOOLEAN)')
+db.exec('CREATE INDEX IF NOT EXISTS tree_snapshots_treeId ON tree_snapshots (treeId)');
+
 const treesByOwner = db.prepare('SELECT * FROM trees WHERE owner = ?');
 const treeOwner = db.prepare('SELECT owner FROM trees WHERE id = ?').pluck();
 const treesModdedBeforeWithSnapshots = db.prepare('SELECT DISTINCT t.id FROM trees t JOIN tree_snapshots ts ON t.id = ts.treeId WHERE ts.delta = 0 AND t.updatedAt < ? ORDER BY t.updatedAt ASC');
@@ -73,8 +80,7 @@ const upsertMany = db.transaction((trees) => {
 });
 
 // Cards Table
-db.exec('CREATE TABLE IF NOT EXISTS cards (id TEXT PRIMARY KEY, treeId TEXT, content TEXT, parentId TEXT, position FLOAT, updatedAt TEXT, deleted BOOLEAN)');
-db.exec('CREATE INDEX IF NOT EXISTS cards_treeId ON cards (treeId)');
+
 const cardsSince = db.prepare('SELECT * FROM cards WHERE treeId = ? AND updatedAt > ? ORDER BY updatedAt ASC');
 const cardsAllUndeleted = db.prepare('SELECT * FROM cards WHERE treeId = ? AND deleted = FALSE ORDER BY updatedAt ASC');
 const cardById = db.prepare('SELECT * FROM cards WHERE id = ?');
@@ -86,8 +92,6 @@ const cardDelete = db.prepare('UPDATE cards SET updatedAt = ?, deleted = TRUE WH
 const cardUndelete = db.prepare('UPDATE cards SET deleted = FALSE WHERE id = ?');
 
 // Tree Snapshots Table
-db.exec('CREATE TABLE IF NOT EXISTS tree_snapshots ( snapshot TEXT, treeId TEXT, id TEXT, content TEXT, parentId TEXT, position REAL, updatedAt TEXT, delta BOOLEAN)')
-db.exec('CREATE INDEX IF NOT EXISTS tree_snapshots_treeId ON tree_snapshots (treeId)');
 const takeSnapshotSQL = db.prepare(`
 INSERT INTO tree_snapshots (snapshot, treeId, id, content, parentId, position, updatedAt, delta)
 SELECT
@@ -174,11 +178,15 @@ const takeSnapshotDebounced = _.memoizeDebounce((treeId) => {
 
 /* ==== SETUP ==== */
 
-const nano = Nano(`http://${config.COUCHDB_USER}:${config.COUCHDB_PASS}@127.0.0.1:5984`);
+
 
 const app = express();
+// const appPouchDB = express();
 const port = process.env.PORT || 3000;
+const port1 = process.env.PORT || 3001;
 
+app.use(cors());
+// appPouchDB.use(cors());
 // Use morgan to log requests in immediate mode:
 app.use(morgan(':remote-addr - :remote-user [:date[clf]] ":method :url HTTP/:http-version"', {"immediate": true}));
 // Use morgan to log responses separately:
@@ -187,37 +195,44 @@ app.use(morgan(':remote-addr - :remote-user [:date[clf]] ":method :url HTTP/:htt
 app.use(express.json({limit: '50mb'}));
 app.use(express.urlencoded({ extended: true }));
 
-sgMail.setApiKey(config.SENDGRID_API_KEY);
+// sgMail.setApiKey(config.SENDGRID_API_KEY);
 
 
 /* ==== Start Server ==== */
+// const nano = Nano(`http://${config.COUCHDB_USER}:${config.COUCHDB_PASS}@127.0.0.1:3000`);
+// const nano = Nano({url:`http://localhost:3000//db`, parseUrl: false});
+const nano = Nano({url:`http://localhost:3000/db`, parseUrl: false});
 
-const server = app.listen(port, () => console.log(`Example app listening at https://localhost:${port}`));
+const server = app.listen(port, () => console.log(`Example app listening at http://localhost:${port}`));
+// const server1 = appPouchDB.listen(port1, () => console.log(`Example app listening at https://localhost:${port1}`));
+var TempPouchDB = PouchDB.defaults({prefix: '../data/pouch'});
+app.use('/db', expressPouchDB(TempPouchDB));
 
 // Session
 
-const RedisStore = redisConnect(session);
-const redis = createClient({legacyMode: true});
+// const RedisStore = redisConnect(session);
+// const redis = createClient({legacyMode: true});
 const sessionParser = session({
-    store: new RedisStore({ client: redis }),
-    secret: config.SESSION_SECRET,
+    // store: new RedisStore({ client: redis }),
+    secret: "config.SESSION_SECRET",
     resave: false,
     saveUninitialized: true,
     cookie: { secure: false, maxAge: /* 14 days */ 1209600000 }
 });
-redis.connect().catch(console.error);
+// redis.connect().catch(console.error);
 
-redis.on("error", function (err) {
-  console.error("Redis Error " + err);
-});
-redis.on("connect", function () {
-  console.log("Redis connected");
-});
+// redis.on("error", function (err) {
+//   console.error("Redis Error " + err);
+// });
+// redis.on("connect", function () {
+//   console.log("Redis connected");
+// });
 app.use(sessionParser);
 
 /* ==== WebSocket ==== */
 
 const wss = new WebSocketServer({noServer: true});
+// const wss = new WebSocketServer({server});
 const wsToUser = new Map();
 const userToWs = new Map();
 
@@ -381,6 +396,8 @@ server.on('upgrade', async (request, socket, head) => {
       return;
     }
 
+    console.log(request)
+
     if (request.session && request.session.user) {
       wss.handleUpgrade(request, socket, head, (ws) => {
         wss.emit('connection', ws, request);
@@ -409,38 +426,13 @@ app.post('/signup', async (req, res) => {
   let userDbName = `userdb-${toHex(email)}`;
   const timestamp = Date.now();
   const confirmTime = didSubscribe ? null : timestamp;
-  const trialExpiry = timestamp + 14*24*3600*1000;
+  const trialExpiry = timestamp + 10000*24*3600*1000;
 
   const salt = crypto.randomBytes(16).toString('hex');
   let hash = crypto.pbkdf2Sync(password, salt, iterations, keylen, digest).toString(encoding);
   try {
     let userInsertInfo = userSignup.run(email, salt, hash, timestamp, confirmTime, "trial:" + trialExpiry, "en");
     const user = userByRowId.get(userInsertInfo.lastInsertRowid);
-
-    if (email !== "cypress@testing.com" && didSubscribe) {
-      try {
-        const options =
-            {
-              url: "https://api.mailerlite.com/api/v2/groups/106198315/subscribers"
-              , method: 'post'
-              , headers: {
-                'Accept': 'application/json'
-                , 'X-MailerLite-ApiDocs': 'true'
-                , 'Content-Type': 'application/json'
-                , 'X-MailerLite-ApiKey': config.MAILERLITE_API_KEY
-              }
-              , data: {
-                email: email
-                , resubscribe: true
-                , autoresponders: true
-                , type: 'unconfirmed'
-              }
-            };
-        axios(options);
-      } catch (mailErr) {
-        console.error(mailErr);
-      }
-    }
 
     req.session.regenerate((err) => {
       if(err) { console.error(err); }
@@ -449,11 +441,11 @@ app.post('/signup', async (req, res) => {
 
       req.session.save(async (err) => {
         if(err) { console.error(err); }
-
-        await nano.db.create(userDbName);
+        var nano2: any = nano;
+        await (nano2.db || nano2.server.db).create(userDbName)
+        await  nano.request({db: userDbName, method: 'put', path: '_security', body: {members: {names: [email], roles: []}}});
 
         //@ts-ignore
-        await nano.request({db: userDbName, method: 'put', path: '/_security', body: {members: {names: [email], roles: []}}});
 
         let data = _.omit(user, ['id', 'email', 'password', 'salt']);
         data.email = user.id;
@@ -599,17 +591,17 @@ app.post('/reset-password', async (req, res) => {
 
 /* ==== DB proxy ==== */
 
-app.use('/db', proxy('http://127.0.0.1:5984', {
-  proxyReqOptDecorator: function(proxyReqOpts, srcReq) {
-    if (srcReq.session.user) {
-      proxyReqOpts.headers['X-Auth-CouchDB-UserName'] = srcReq.session.user;
-      proxyReqOpts.headers['X-Auth-CouchDB-Roles'] = '';
-    } else {
-      //console.log('No user in session for /db', srcReq);
-    }
-    return proxyReqOpts;
-  }
-}));
+// app.use('/db', proxy('http://127.0.0.1:5984', {
+//   proxyReqOptDecorator: function(proxyReqOpts, srcReq) {
+//     if (srcReq.session.user) {
+//       proxyReqOpts.headers['X-Auth-CouchDB-UserName'] = srcReq.session.user;
+//       proxyReqOpts.headers['X-Auth-CouchDB-Roles'] = '';
+//     } else {
+//       //console.log('No user in session for /db', srcReq);
+//     }
+//     return proxyReqOpts;
+//   }
+// }));
 
 
 /* ==== Contact Us Route ==== */
@@ -646,77 +638,6 @@ app.post('/pleasenospam', async (req, res) => {
   }
 });
 
-
-
-/* ==== Payment ==== */
-
-const stripe = new Stripe(config.STRIPE_SECRET_KEY, { apiVersion: '2022-11-15', typescript: true });
-
-app.post('/create-checkout-session', async (req, res) => {
-  const { priceId, customer_email } = req.body;
-
-  try {
-    // @ts-ignore : docs say to remove 'payment_method_types' but typescript complains
-    const stripeSession = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      line_items: [
-        {
-          price: priceId,
-          quantity: 1,
-        },
-      ],
-      allow_promotion_codes: true,
-      customer_email: customer_email,
-      success_url: config.URL_ROOT + '/upgrade/success?session_id={CHECKOUT_SESSION_ID}',
-      cancel_url: config.URL_ROOT,
-    });
-
-    res.send({
-      sessionId: stripeSession.id,
-    });
-  } catch (e) {
-    console.error(e);
-    res.status(400);
-    return res.send({
-      error: {
-        message: e.message,
-      }
-    });
-  }
-});
-
-
-app.post('/create-portal-session', async (req, res) => {
-  const { customer_id } = req.body;
-
-  const stripeSession = await stripe.billingPortal.sessions.create({
-    customer: customer_id
-  });
-
-  res.redirect(stripeSession.url);
-});
-
-
-app.post('/hooks', async (req, res) => {
-  let event = req.body;
-
-  // Handle the event
-  switch (event.type) {
-    case 'checkout.session.completed':
-      // Get data from event
-      let email = event.data.object.customer_email;
-      let custId = event.data.object.customer;
-      userSetPaymentStatus.run("customer:" + custId, email);
-      sendUpdatedUserData(email);
-      break;
-    // ... handle other event types
-    default:
-      console.log(`Unhandled event type ${event.type}`);
-  }
-
-  // Return a res to acknowledge receipt of the event
-  res.json({received: true});
-});
 
 
 /* ==== Mail confirmation ==== */
@@ -760,54 +681,6 @@ app.post('/export-docx', async (req, res) => {
 });
 
 
-
-/* ==== Testing ==== */
-
-app.delete('/test/user', async (req, res) => {
-  let userDbName = `userdb-${toHex("cypress@testing.com")}`;
-
-  try {
-    await nano.db.destroy(userDbName).catch(e => null);
-    res.status(200).send();
-  } catch (err) {
-    console.error(err);
-    res.status(500).send(err);
-  }
-});
-
-app.post('/test/expired', async (req, res) => {
-  try {
-    expireTestUser.run();
-    sendUpdatedUserData("cypress@testing.com");
-    res.status(200).send();
-  } catch (err) {
-    console.error(err);
-    res.status(500).send(err);
-  }
-});
-
-app.post('/test/trees', async (req, res) => {
-  const trees = req.body;
-  try {
-    upsertMany(trees);
-    res.status(200).send();
-  } catch (err) {
-    console.error(err);
-    res.status(500).send(err);
-  }
-});
-
-app.post('/test/confirm', async (req, res) => {
-  try {
-    confirmedHandler("cypress@testing.com")
-    res.status(200).send();
-  } catch (err) {
-    console.error(err);
-    res.status(500).send(err);
-  }
-});
-
-
 app.get('/utils/compact', (req, res) => {
   if (req.hostname === 'localhost' || req.hostname === '127.0.0.1') {
     const daysAgo = req.query.daysAgo;
@@ -836,9 +709,7 @@ app.get('/utils/decimate', (req, res) => {
 
 /* ==== Static ==== */
 
-app.use(express.static("../client/web"));
-
-
+app.use(express.static("../web"));
 
 
 
@@ -847,10 +718,9 @@ app.use(express.static("../client/web"));
 
 // Respond to all non-file requests with index.html
 app.get('*', (req, res) => {
-  const index = new URL('../../client/web/index.html', import.meta.url).pathname;
+  const index = new URL('../../web/index.html', import.meta.url).pathname;
   res.sendFile(index);
 });
-
 
 /* ==== Delta Handlers ==== */
 
